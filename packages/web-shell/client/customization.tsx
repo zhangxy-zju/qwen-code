@@ -24,7 +24,8 @@ export interface WebShellCodeBlockRenderInfo {
   language: string;
   /**
    * Canonical Shiki language id after applying built-in aliases, or `text`
-   * when the language is unsupported by the fallback highlighter.
+   * when the language is unsupported by the fallback highlighter. Custom
+   * renderers should dispatch on `language` for non-highlight languages.
    */
   resolvedLanguage: string;
   className?: string;
@@ -37,13 +38,14 @@ export interface WebShellCodeBlockRenderInfo {
 
 /**
  * Return a React node to replace the default code block rendering. Return
- * `null`, `undefined`, or `false` to decline and fall back to the built-in code
- * block renderer. Expensive renderers should debounce or defer work while
+ * `null` or `undefined` to decline and fall back to the built-in code block
+ * renderer. Boolean returns are treated as decline at runtime for defensive
+ * compatibility. Expensive renderers should debounce or defer work while
  * `info.isStreaming` is true.
  */
 export type CodeBlockRenderer = (
   info: WebShellCodeBlockRenderInfo,
-) => ReactNode | null | undefined;
+) => Exclude<ReactNode, boolean> | null | undefined;
 
 export interface WebShellMarkdownCustomization {
   transformMarkdown?: (

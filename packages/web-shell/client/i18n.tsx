@@ -214,6 +214,7 @@ const EN: Messages = {
   'code.copy': 'Copy',
   'code.copied': 'Copied!',
   'echartsChart.defaultTitle': 'Chart Loading',
+  'echartsChart.untitledChart': 'Chart',
   'echartsChart.noData': 'No data',
   'echartsChart.tableNotice': (v) => {
     const omittedRows = Number(v?.omittedRows ?? 0);
@@ -1488,6 +1489,7 @@ const ZH: Messages = {
   'code.copy': '复制',
   'code.copied': '已复制！',
   'echartsChart.defaultTitle': '图表加载中',
+  'echartsChart.untitledChart': '图表',
   'echartsChart.noData': '暂无数据',
   'echartsChart.tableNotice': (v) => {
     const omittedRows = Number(v?.omittedRows ?? 0);

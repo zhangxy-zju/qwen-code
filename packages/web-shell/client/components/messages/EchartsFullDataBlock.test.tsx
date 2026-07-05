@@ -7,7 +7,6 @@ import { I18nProvider } from '../../i18n';
 import { ThemeProvider } from '../../themeContext';
 import { Markdown } from './Markdown';
 import {
-  ECHARTS_FULLDATA_SANITIZER_KEY_OVERLAP,
   EchartsFullDataBlock,
   createEchartsFullDataRenderer,
   type EchartsFullDataOption,
@@ -120,10 +119,6 @@ afterEach(async () => {
 });
 
 describe('EchartsFullDataBlock', () => {
-  it('keeps top-level allowlist keys disjoint from nested denylist keys', () => {
-    expect(ECHARTS_FULLDATA_SANITIZER_KEY_OVERLAP).toEqual([]);
-  });
-
   it('does not render echarts blocks from thinking markdown', async () => {
     const runtime: EchartsRuntime = {
       init: vi.fn(() => ({
@@ -745,6 +740,90 @@ describe('EchartsFullDataBlock', () => {
         },
       }),
     );
+  });
+
+  it('renders an artifact-backed chart end-to-end through markdown customization', async () => {
+    const setOption = vi.fn();
+    const runtime: EchartsRuntime = {
+      init: vi.fn(() => ({
+        setOption,
+        resize: vi.fn(),
+        dispose: vi.fn(),
+      })),
+    };
+    const artifactStore = new Map([
+      [
+        'artifact://reports/monthly-sales',
+        {
+          dimensions: ['month', 'sales'],
+          source: [
+            ['Jan', 120],
+            ['Feb', 180],
+            ['Mar', 150],
+          ],
+        },
+      ],
+    ]);
+    const resolveDataRef = vi.fn<EchartsFullDataRefResolver>((ref, meta) => {
+      expect(meta).toEqual({
+        format: 'json',
+        dimensions: ['month', 'sales'],
+      });
+      const artifact = artifactStore.get(ref);
+      if (!artifact) throw new Error(`Missing artifact: ${ref}`);
+      return artifact;
+    });
+
+    const container = await renderEchartsMarkdown({
+      code: JSON.stringify({
+        version: 1,
+        data: {
+          kind: 'ref',
+          ref: 'artifact://reports/monthly-sales',
+          format: 'json',
+          dimensions: ['month', 'sales'],
+        },
+        option: {
+          title: { text: 'Monthly sales artifact' },
+          xAxis: { type: 'category' },
+          yAxis: { type: 'value' },
+          series: [{ type: 'line', encode: { x: 'month', y: 'sales' } }],
+        },
+      }),
+      loadEcharts: () => runtime,
+      resolveDataRef,
+    });
+    await flushChart();
+
+    expect(resolveDataRef).toHaveBeenCalledOnce();
+    expect(runtime.init).toHaveBeenCalledOnce();
+    expect(container.querySelector('pre code')).toBeNull();
+    expect(
+      container.querySelector('[data-testid="echarts-fulldata-rendered"]'),
+    ).not.toBeNull();
+    expect(container.textContent).toContain('Monthly sales artifact');
+    expect(setOption.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        dataset: {
+          dimensions: ['month', 'sales'],
+          source: [
+            ['Jan', 120],
+            ['Feb', 180],
+            ['Mar', 150],
+          ],
+        },
+      }),
+    );
+
+    await act(async () => {
+      container.querySelectorAll('button')[1]?.click();
+    });
+
+    expect(getDataRows(container)).toEqual([
+      ['Jan', '120'],
+      ['Feb', '180'],
+      ['Mar', '150'],
+    ]);
   });
 
   it('does not refetch resolved ref data when streaming toggles with unchanged code', async () => {
@@ -1917,15 +1996,16 @@ describe('EchartsFullDataBlock', () => {
       expect(container.querySelector('[role="status"]')).not.toBeNull();
 
       await act(async () => {
-        vi.advanceTimersByTime(30_000);
+        vi.advanceTimersByTime(10_000);
         await Promise.resolve();
         await Promise.resolve();
       });
 
       expect(container.textContent).toContain('Chart runtime load timed out.');
       expect(console.warn).toHaveBeenCalledWith(
-        '[web-shell] echarts-fulldata runtime load timed out after %dms',
-        30_000,
+        '[web-shell] echarts-fulldata runtime load timed out after %dms (%s)',
+        10_000,
+        expect.stringContaining('serialized length='),
       );
       expect(consoleError).toHaveBeenCalledWith(
         '[web-shell] echarts-fulldata render failed:',
@@ -2133,6 +2213,48 @@ describe('EchartsFullDataBlock', () => {
     expect(consoleError).toHaveBeenCalledWith(
       '[web-shell] echarts-fulldata render failed:',
       expect.any(Error),
+    );
+  });
+
+  it('logs and swallows chart disposal failures during cleanup', async () => {
+    const disposeError = new Error('dispose failed');
+    const runtime: EchartsRuntime = {
+      init: vi.fn(() => ({
+        setOption: vi.fn(),
+        resize: vi.fn(),
+        dispose: vi.fn(() => {
+          throw disposeError;
+        }),
+      })),
+    };
+    const option: EchartsFullDataOption = {
+      dataset: {
+        dimensions: ['day', 'orders'],
+        source: [{ day: 'Mon', orders: 120 }],
+      },
+      xAxis: { type: 'category' },
+      yAxis: { type: 'value' },
+      series: [{ type: 'bar', encode: { x: 'day', y: 'orders' } }],
+    };
+
+    const { root } = await mount(
+      <I18nProvider language="en">
+        <EchartsFullDataBlock
+          option={option}
+          theme="dark"
+          loadEcharts={() => runtime}
+        />
+      </I18nProvider>,
+    );
+    await flushChart();
+
+    await act(async () => {
+      root.unmount();
+    });
+
+    expect(console.warn).toHaveBeenCalledWith(
+      '[web-shell] echarts-fulldata dispose failed:',
+      disposeError,
     );
   });
 
@@ -2366,8 +2488,10 @@ describe('EchartsFullDataBlock', () => {
       symbol: 'image://https://example.test/marker.png',
       tooltip: {
         appendToBody: true,
+        className: 'app-shell-overlay',
         enterable: true,
         formatter: '<img src=x onerror=alert(1)>',
+        position: [10, 10],
         renderMode: 'html',
       },
     };
@@ -2377,6 +2501,9 @@ describe('EchartsFullDataBlock', () => {
     });
     const unsafeRow: Record<string, unknown> = {
       day: 'javascript:alert(1)',
+      region: '<img src=x onerror=alert(1)>',
+      constructor: 'polluted constructor',
+      prototype: 'polluted prototype',
       orders: 120,
     };
     Object.defineProperty(unsafeRow, '__proto__', {
@@ -2418,8 +2545,10 @@ describe('EchartsFullDataBlock', () => {
         data: ['Mon', 'Tue'],
       },
       tooltip: {
+        className: 'global-tooltip',
         formatter: '<img src=x onerror=alert(1)>',
         extraCssText: 'background-image:url(https://example.test/x.png)',
+        position: [0, 0],
       },
       xAxis: {
         type: 'category',
@@ -2457,8 +2586,10 @@ describe('EchartsFullDataBlock', () => {
       graphic?: unknown;
       legend?: { data?: unknown };
       tooltip?: {
+        className?: unknown;
         formatter?: unknown;
         extraCssText?: string;
+        position?: unknown;
         renderMode?: string;
         enterable?: boolean;
       };
@@ -2490,9 +2621,11 @@ describe('EchartsFullDataBlock', () => {
         symbol?: string;
         tooltip?: {
           appendToBody?: boolean;
+          className?: unknown;
           confine?: boolean;
           enterable?: boolean;
           formatter?: unknown;
+          position?: unknown;
           renderMode?: string;
         };
       }>;
@@ -2511,6 +2644,19 @@ describe('EchartsFullDataBlock', () => {
       '2024',
     ]);
     expect(renderedOption.dataset?.[0]?.source?.[0]?.day).toBe('');
+    expect(renderedOption.dataset?.[0]?.source?.[0]?.region).toBe('');
+    expect(
+      Object.prototype.hasOwnProperty.call(
+        renderedOption.dataset?.[0]?.source?.[0],
+        'constructor',
+      ),
+    ).toBe(false);
+    expect(
+      Object.prototype.hasOwnProperty.call(
+        renderedOption.dataset?.[0]?.source?.[0],
+        'prototype',
+      ),
+    ).toBe(false);
     expect(renderedOption.dataset?.[0]?.source).toHaveLength(1);
     expect(
       Object.getPrototypeOf(renderedOption.dataset?.[0]?.source?.[0]),
@@ -2524,6 +2670,8 @@ describe('EchartsFullDataBlock', () => {
     expect(renderedOption.dataset?.[1]?.source?.[0]?.day).toBe('Tue');
     expect(renderedOption.legend?.data).toBeUndefined();
     expect(renderedOption.tooltip?.formatter).toBeUndefined();
+    expect(renderedOption.tooltip?.className).toBeUndefined();
+    expect(renderedOption.tooltip?.position).toBeUndefined();
     expect(renderedOption.tooltip?.extraCssText).not.toContain('https://');
     expect(renderedOption.tooltip).toEqual(
       expect.objectContaining({
@@ -2562,6 +2710,8 @@ describe('EchartsFullDataBlock', () => {
     expect(renderedOption.series?.[0]?.stack).toBeUndefined();
     expect(renderedOption.series?.[0]?.symbol).toBe('circle');
     expect(renderedOption.series?.[0]?.tooltip?.formatter).toBeUndefined();
+    expect(renderedOption.series?.[0]?.tooltip?.className).toBeUndefined();
+    expect(renderedOption.series?.[0]?.tooltip?.position).toBeUndefined();
     expect(renderedOption.series?.[0]?.tooltip).toEqual(
       expect.objectContaining({
         appendToBody: false,
@@ -2635,7 +2785,7 @@ describe('EchartsFullDataBlock', () => {
     expect(container.textContent).toContain('Recovered title');
   });
 
-  it('uses the default title when a single title object has empty text', async () => {
+  it('uses the untitled chart label when a single title object has empty text', async () => {
     const option: EchartsFullDataOption = {
       title: { text: '' },
       dataset: {
@@ -2651,7 +2801,7 @@ describe('EchartsFullDataBlock', () => {
       <EchartsFullDataBlock option={option} theme="dark" />,
     );
 
-    expect(container.querySelector('[title="Chart Loading"]')).not.toBeNull();
+    expect(container.querySelector('[title="Chart"]')).not.toBeNull();
   });
 
   it('shows an error when the chart runtime is unavailable', async () => {
@@ -2696,7 +2846,7 @@ describe('EchartsFullDataBlock', () => {
       container
         .querySelector('[data-testid="echarts-fulldata-rendered"]')
         ?.getAttribute('aria-label'),
-    ).toBe('图表加载中');
+    ).toBe('图表');
     expect(container.textContent).toContain('图表运行时不可用。');
     expect(
       container.querySelector('button[aria-label="显示图表"]'),

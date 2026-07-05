@@ -153,6 +153,7 @@ const MAX_SERIES_COUNT = 100;
 const MAX_FORMATTER_TEMPLATE_LENGTH = 4_096;
 const MAX_FORMATTER_DIMENSION_LENGTH = 256;
 const DATA_REF_TIMEOUT_MS = 30_000;
+const RUNTIME_LOAD_TIMEOUT_MS = 10_000;
 const SUPPORTED_DATA_REF_PREFIXES = ['artifact://', 'session-file://'];
 const SUPPORTED_DATA_REF_FORMATS = new Set(['csv', 'json']);
 const UNSAFE_URI_WITH_AUTHORITY_PATTERN = /^[a-z][a-z0-9+.-]*:\/\//;
@@ -167,10 +168,10 @@ const ECHARTS_TEMPLATE_DIMENSION_METACHAR_PATTERN = /[|{}]/;
 const WINDOWS_DRIVE_SEGMENT_PATTERN = /^[a-z]:/i;
 const noop = () => {};
 
-// Sanitization is intentionally two-layered: top-level option keys are an
-// allowlist/default-deny surface, while nested keys are a denylist/default-allow
-// surface. UNSAFE_OPTION_KEYS does not backstop SAFE_TOP_LEVEL_OPTION_KEYS; any
-// key promoted to the top-level allowlist needs a fresh subtree review.
+// Sanitization has three intentionally different surfaces: top-level option keys
+// are allowlisted, nested option keys are denylisted, and dataset entries keep
+// only renderer-supported `dimensions`/`source` data. A top-level key promotion
+// or dataset feature expansion needs a fresh subtree review.
 const SAFE_TOP_LEVEL_OPTION_KEYS = new Set([
   'angleAxis',
   'backgroundColor',
@@ -213,12 +214,12 @@ const UNSAFE_OPTION_KEYS = new Set([
   'url',
 ]);
 
-export const ECHARTS_FULLDATA_SANITIZER_KEY_OVERLAP = Object.freeze(
-  [...SAFE_TOP_LEVEL_OPTION_KEYS].filter((key) => UNSAFE_OPTION_KEYS.has(key)),
-);
-
 function isObject(value: unknown): value is EchartsObject {
   return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isUnsafePropertyKey(key: string): boolean {
+  return UNSAFE_DIMENSION_NAMES.has(key);
 }
 
 function mergeDefaults(defaults: EchartsObject, value: unknown): EchartsObject {
@@ -252,6 +253,8 @@ function forceTooltipSafety(value: unknown, safeExtraCssText: string): unknown {
           enterable: false,
           extraCssText: safeExtraCssText,
           renderMode: 'richText',
+          position: undefined,
+          className: undefined,
         }
       : entry;
 
@@ -307,6 +310,7 @@ function isUnsafeUriString(value: string): boolean {
     UNSAFE_URI_WITH_AUTHORITY_PATTERN.test(normalized) ||
     normalized.startsWith('blob:') ||
     normalized.startsWith('data:') ||
+    normalized.startsWith('file:') ||
     normalized.startsWith('image://') ||
     normalized.startsWith('javascript:') ||
     normalized.startsWith('vbscript:')
@@ -345,7 +349,8 @@ function getUnsafeDimensionError(dimensions: string[]): string | undefined {
 }
 
 function sanitizeDatasetCell(value: unknown): DatasetCell {
-  if (typeof value === 'string') return isUnsafeUriString(value) ? '' : value;
+  if (typeof value === 'string')
+    return isUnsafeOptionString(value) ? '' : value;
   if (typeof value === 'number' && Number.isFinite(value)) return value;
   if (typeof value === 'boolean' || value === null) return value;
   return '';
@@ -357,7 +362,7 @@ function sanitizeDatasetRow(row: unknown): DatasetRow | undefined {
 
   const sanitized: Record<string, DatasetCell> = {};
   for (const [key, value] of Object.entries(row)) {
-    if (key === '__proto__') continue;
+    if (isUnsafePropertyKey(key)) continue;
     sanitized[key] = sanitizeDatasetCell(value);
   }
   return sanitized;
@@ -380,7 +385,7 @@ function sanitizeOptionValue(value: unknown, path: string[] = []): unknown {
   if (isObject(value)) {
     const sanitized: EchartsObject = {};
     for (const [key, entry] of Object.entries(value)) {
-      if (key === '__proto__') continue;
+      if (isUnsafePropertyKey(key)) continue;
       if (
         UNSAFE_OPTION_KEYS.has(key) &&
         !(key === 'data' && isAllowedAnnotationData(path))
@@ -946,6 +951,7 @@ function validateDatasetCell(
   value: unknown,
   rowIndex: number,
   cellIndex: number,
+  prefix = 'Chart data',
 ): string | undefined {
   if (
     typeof value === 'string' ||
@@ -957,7 +963,7 @@ function validateDatasetCell(
   if (typeof value === 'number' && Number.isFinite(value)) {
     return undefined;
   }
-  return `Chart data row ${rowIndex + 1} cell ${cellIndex + 1} must be a string, number, boolean, or null.`;
+  return `${prefix} row ${rowIndex + 1} cell ${cellIndex + 1} must be a string, number, boolean, or null.`;
 }
 
 function validateDatasetRows(
@@ -1085,15 +1091,13 @@ function normalizeEnvelopeDataset(value: unknown): {
 
     const nextRow: DatasetCell[] = [];
     for (const [cellIndex, cell] of row.entries()) {
-      const cellError = validateDatasetCell(cell, rowIndex, cellIndex);
-      if (cellError) {
-        return {
-          parseError: cellError.replace(
-            'Chart data row',
-            'Chart envelope data.source row',
-          ),
-        };
-      }
+      const cellError = validateDatasetCell(
+        cell,
+        rowIndex,
+        cellIndex,
+        'Chart envelope data.source',
+      );
+      if (cellError) return { parseError: cellError };
       nextRow.push(cell as DatasetCell);
     }
     rows.push(nextRow);
@@ -1636,21 +1640,31 @@ function ChartLoadingState() {
 
 function loadEchartsWithTimeout(
   loadRuntime: EchartsRuntimeLoader,
+  context: string,
 ): Promise<EchartsRuntime> {
   return new Promise((resolve, reject) => {
     const timeoutId = globalThis.setTimeout(() => {
       console.warn(
-        '[web-shell] echarts-fulldata runtime load timed out after %dms',
-        DATA_REF_TIMEOUT_MS,
+        '[web-shell] echarts-fulldata runtime load timed out after %dms (%s)',
+        RUNTIME_LOAD_TIMEOUT_MS,
+        context,
       );
       reject(new Error('Chart runtime load timed out.'));
-    }, DATA_REF_TIMEOUT_MS);
+    }, RUNTIME_LOAD_TIMEOUT_MS);
 
     Promise.resolve()
       .then(loadRuntime)
       .then(resolve, reject)
       .finally(() => globalThis.clearTimeout(timeoutId));
   });
+}
+
+function getRuntimeLoadContext(option: EchartsFullDataOption): string {
+  try {
+    return `option keys=${Object.keys(option).length}, serialized length=${JSON.stringify(option).length}`;
+  } catch {
+    return `option keys=${Object.keys(option).length}`;
+  }
 }
 
 export function EchartsFullDataBlock({
@@ -1693,7 +1707,11 @@ export function EchartsFullDataBlock({
   const disposeChart = useCallback(() => {
     removeResizeRef.current();
     removeResizeRef.current = noop;
-    chartInstanceRef.current?.dispose();
+    try {
+      chartInstanceRef.current?.dispose();
+    } catch (error) {
+      console.warn('[web-shell] echarts-fulldata dispose failed:', error);
+    }
     chartInstanceRef.current = undefined;
     chartThemeRef.current = undefined;
   }, []);
@@ -1755,7 +1773,10 @@ export function EchartsFullDataBlock({
         if (!chart) {
           const loadRuntime = loadEchartsRef.current;
           if (!loadRuntime || !chartRef.current) return;
-          const runtime = await loadEchartsWithTimeout(loadRuntime);
+          const runtime = await loadEchartsWithTimeout(
+            loadRuntime,
+            getRuntimeLoadContext(chartOption),
+          );
           if (requestId !== renderRequestRef.current || !chartRef.current) {
             return;
           }
@@ -1815,7 +1836,7 @@ export function EchartsFullDataBlock({
     theme,
   ]);
 
-  const title = getTitle(option) ?? t('echartsChart.defaultTitle');
+  const title = getTitle(sanitizedOption) ?? t('echartsChart.untitledChart');
 
   return (
     <section
